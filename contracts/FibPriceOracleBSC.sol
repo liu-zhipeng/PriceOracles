@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.4;
 
 import "./PriceOracle.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interfaces/IERC20.sol";
+import "./libraries/SafeMath.sol";
+import "./libraries/SafeERC20.sol";
 
 interface IStdReference {
     /// A structure returned whenever someone requests for standard reference data.
@@ -19,6 +21,31 @@ interface IStdReference {
     function getReferenceDataBulk(string[] memory _bases, string[] memory _quotes) external view returns (ReferenceData[] memory);
 }
 
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+
+    // getRoundData and latestRoundData should both raise "No data present"
+    // if they do not have data to report, instead of returning unset values
+    // which could be misinterpreted as actual reported values.
+    function getRoundData(uint80 _roundId) external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+
 contract FibPriceOracleBSC is PriceOracle {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
@@ -26,6 +53,11 @@ contract FibPriceOracleBSC is PriceOracle {
 
     IStdReference ref;
     address public wrapped = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+
+    uint256 public maxPriceDiff = 0.1e18;
+
+    /// @notice Chainlink Aggregators
+    mapping(address => AggregatorV3Interface) public aggregators;    
 
     struct PriceInfo {
         address token;              // Address of token contract, TOKEN
@@ -38,6 +70,8 @@ contract FibPriceOracleBSC is PriceOracle {
     
     event NewAdmin(address oldAdmin, address newAdmin);
     event PriceRecordUpdated(address token, address baseToken, address lpToken, bool _active);
+    event AggregatorUpdated(address tokenAddress, address source);
+    event MaxPriceDiffUpdated(uint maxDiff);
 
     constructor(IStdReference _ref) {
         ref = _ref;
@@ -45,32 +79,95 @@ contract FibPriceOracleBSC is PriceOracle {
     }
 
     function getTokenPrice(address _tokenAddress) public view override returns (uint256) {
-        IERC20 token = IERC20(_tokenAddress);
-        IStdReference.ReferenceData memory data = ref.getReferenceData(token.symbol(), "USD");
-        uint256 price = data.rate;
-        uint256 decimalDelta = 18-uint256(token.decimals());
-        return price.mul(10**decimalDelta);
+        uint256 tokenPrice = getPriceFromOracle(_tokenAddress);
+        if (tokenPrice == 0) {
+            tokenPrice = getPriceFromDex(_tokenAddress);
+        } 
+        return tokenPrice;
     }
 
     function getPriceFromDex(address _tokenAddress) public view returns (uint256) {
         PriceInfo storage priceInfo = priceRecords[_tokenAddress];
         if (priceInfo.active) {
-            return 1;
+            uint256 rawTokenAmount = IERC20(priceInfo.token).balanceOf(priceInfo.lpToken);
+            uint256 tokenDecimalDelta = 18-uint256(IERC20(priceInfo.token).decimals());
+            uint256 tokenAmount = rawTokenAmount.mul(10**tokenDecimalDelta);
+            uint256 rawBaseTokenAmount = IERC20(priceInfo.baseToken).balanceOf(priceInfo.lpToken);
+            uint256 baseTokenDecimalDelta = 18-uint256(IERC20(priceInfo.baseToken).decimals());
+            uint256 baseTokenAmount = rawBaseTokenAmount.mul(10**baseTokenDecimalDelta);
+            uint256 baseTokenPrice = getPriceFromOracle(priceInfo.baseToken);
+            uint256 tokenPrice = baseTokenPrice.mul(baseTokenAmount).div(tokenAmount);
+
+            return tokenPrice;
         } else {
             return 0;
         }
     }
 
     function getPriceFromOracle(address _tokenAddress) public view returns (uint256) {
+        uint256 chainLinkPrice = getPriceFromChainlink(_tokenAddress);
+        uint256 bandPrice = getPriceFromBand(_tokenAddress);
+        if (chainLinkPrice != 0 && bandPrice != 0) {
+            checkPriceDiff(chainLinkPrice, bandPrice);
+
+            return (bandPrice.add(chainLinkPrice)).div(2);
+        }
+
+        if (chainLinkPrice != 0) {
+            return chainLinkPrice;
+        } 
+        if (bandPrice != 0) {
+            return bandPrice;
+        }
+
+        return 0;
+    }
+
+    function getPriceFromChainlink(address _tokenAddress) public view returns (uint256) {
+        AggregatorV3Interface aggregator = aggregators[_tokenAddress];
+        if (address(aggregator) != address(0)) {
+            ( , int answer, , , ) = aggregator.latestRoundData();
+
+            // It's fine for price to be 0. We have two price feeds.
+            if (answer == 0) {
+                return 0;
+            }
+
+            // Extend the decimals to 1e18.
+            uint retVal = uint(answer);
+            uint price = retVal.mul(10**(18 - uint(aggregator.decimals())));
+
+            uint256 decimalDelta = 18-uint256(IERC20(_tokenAddress).decimals());
+            return price.mul(10**decimalDelta);            
+        }
+        return 0;        
+    }
+
+    function getPriceFromBand(address _tokenAddress) public view returns (uint256) {
         IERC20 token = IERC20(_tokenAddress);
+        string memory tokenSymbol = token.symbol();
+        if (compareStrings(tokenSymbol, "WBNB")) {
+            IStdReference.ReferenceData memory data = ref.getReferenceData("BNB", "USD");
+            return data.rate;
+        } 
         try ref.getReferenceData(token.symbol(), "USD") returns (IStdReference.ReferenceData memory data){
             uint256 price = data.rate;
             uint256 decimalDelta = 18-uint256(token.decimals());
             return price.mul(10**decimalDelta);            
         } catch {
             return 0;
-        }
+        }        
     }
+
+    function checkPriceDiff(uint256 price1, uint256 price2) internal view {
+        uint256 min = price1 < price2 ? price1 : price2;
+        uint256 max = price1 < price2 ? price2 : price1;
+
+        // priceCap = min * (1 + maxPriceDiff)
+        uint256 onePlusMaxDiffMantissa = maxPriceDiff.add(1);
+        uint256 priceCap = min.mul(onePlusMaxDiffMantissa);
+        require(priceCap > max, "too much diff between price feeds");
+    }    
 
     function setDexPriceInfo(address _token, address _baseToken, address _lpToken, bool _active) public {
         require(msg.sender == admin, "only admin can set DEX price");
@@ -91,6 +188,24 @@ contract FibPriceOracleBSC is PriceOracle {
         admin = newAdmin;
 
         emit NewAdmin(oldAdmin, newAdmin);
+    }
+
+    function setAggregators(address[] calldata tokenAddresses, address[] calldata sources) external {
+        require(msg.sender == admin, "only the admin may set the aggregators");
+        for (uint i = 0; i < tokenAddresses.length; i++) {
+            aggregators[tokenAddresses[i]] = AggregatorV3Interface(sources[i]);
+            emit AggregatorUpdated(tokenAddresses[i], sources[i]);
+        }
+    } 
+
+    function setMaxPriceDiff(uint256 _maxPriceDiff) external {
+        require(msg.sender == admin, "only the admin may set the max price diff");
+        maxPriceDiff = _maxPriceDiff;
+        emit MaxPriceDiffUpdated(_maxPriceDiff);
+    }      
+
+    function compareStrings(string memory a, string memory b) internal pure returns (bool) {
+        return (keccak256(abi.encodePacked((a))) == keccak256(abi.encodePacked((b))));
     }    
 
 
