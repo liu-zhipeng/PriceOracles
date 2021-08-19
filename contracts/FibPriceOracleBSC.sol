@@ -3,8 +3,8 @@ pragma solidity ^0.8.4;
 
 import "./PriceOracle.sol";
 import "./interfaces/IERC20.sol";
-import "./libraries/SafeMath.sol";
-import "./libraries/SafeERC20.sol";
+import "./lib/SafeMath.sol";
+import "./lib/SafeERC20.sol";
 
 interface IStdReference {
     /// A structure returned whenever someone requests for standard reference data.
@@ -52,9 +52,10 @@ contract FibPriceOracleBSC is PriceOracle {
     address public admin;
 
     IStdReference ref;
-    address public wrapped = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     uint256 public maxPriceDiff = 0.1e18;
+
+    address public wrapped = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     /// @notice Chainlink Aggregators
     mapping(address => AggregatorV3Interface) public aggregators;    
@@ -79,9 +80,13 @@ contract FibPriceOracleBSC is PriceOracle {
     }
 
     function getTokenPrice(address _tokenAddress) public view override returns (uint256) {
-        uint256 tokenPrice = getPriceFromOracle(_tokenAddress);
+        address tokenAddress = _tokenAddress;
+        if (_tokenAddress == address(0)) {
+            tokenAddress = wrapped;
+        }
+        uint256 tokenPrice = getPriceFromOracle(tokenAddress);
         if (tokenPrice == 0) {
-            tokenPrice = getPriceFromDex(_tokenAddress);
+            tokenPrice = getPriceFromDex(tokenAddress);
         } 
         return tokenPrice;
     }
@@ -144,8 +149,10 @@ contract FibPriceOracleBSC is PriceOracle {
     }
 
     function getPriceFromBand(address _tokenAddress) public view returns (uint256) {
+       
         IERC20 token = IERC20(_tokenAddress);
         string memory tokenSymbol = token.symbol();
+        
         if (compareStrings(tokenSymbol, "WBNB")) {
             IStdReference.ReferenceData memory data = ref.getReferenceData("BNB", "USD");
             return data.rate;
@@ -172,7 +179,6 @@ contract FibPriceOracleBSC is PriceOracle {
     function setDexPriceInfo(address _token, address _baseToken, address _lpToken, bool _active) public {
         require(msg.sender == admin, "only admin can set DEX price");
         PriceInfo storage priceInfo = priceRecords[_token];
-        require(priceInfo.active == false, "price record already listed");
         uint256 baseTokenPrice = getPriceFromOracle(_baseToken);
         require(baseTokenPrice > 0, "invalid base token");
         priceInfo.token = _token;
