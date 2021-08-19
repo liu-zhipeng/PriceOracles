@@ -3,8 +3,8 @@ pragma solidity ^0.8.4;
 
 import "./PriceOracle.sol";
 import "./interfaces/IERC20.sol";
-import "./libraries/SafeMath.sol";
-import "./libraries/SafeERC20.sol";
+import "./lib/SafeMath.sol";
+import "./lib/SafeERC20.sol";
 
 interface IStdReference {
     /// A structure returned whenever someone requests for standard reference data.
@@ -52,9 +52,10 @@ contract FibPriceOracleETH is PriceOracle {
     address public admin;
 
     IStdReference ref;
-    address public wrapped = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     uint256 public maxPriceDiff = 0.1e18;
+
+    address public wrapped = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     /// @notice Chainlink Aggregators
     mapping(address => AggregatorV3Interface) public aggregators;    
@@ -79,9 +80,13 @@ contract FibPriceOracleETH is PriceOracle {
     }
 
     function getTokenPrice(address _tokenAddress) public view override returns (uint256) {
-        uint256 tokenPrice = getPriceFromOracle(_tokenAddress);
+        address tokenAddress = _tokenAddress;
+        if (_tokenAddress == address(0)) {
+            tokenAddress = wrapped;
+        }
+        uint256 tokenPrice = getPriceFromOracle(tokenAddress);
         if (tokenPrice == 0) {
-            tokenPrice = getPriceFromDex(_tokenAddress);
+            tokenPrice = getPriceFromDex(tokenAddress);
         } 
         return tokenPrice;
     }
@@ -106,21 +111,7 @@ contract FibPriceOracleETH is PriceOracle {
 
     function getPriceFromOracle(address _tokenAddress) public view returns (uint256) {
         uint256 chainLinkPrice = getPriceFromChainlink(_tokenAddress);
-        uint256 bandPrice = getPriceFromBand(_tokenAddress);
-        if (chainLinkPrice != 0 && bandPrice != 0) {
-            checkPriceDiff(chainLinkPrice, bandPrice);
-
-            return (bandPrice.add(chainLinkPrice)).div(2);
-        }
-
-        if (chainLinkPrice != 0) {
-            return chainLinkPrice;
-        } 
-        if (bandPrice != 0) {
-            return bandPrice;
-        }
-
-        return 0;
+        return chainLinkPrice;
     }
 
     function getPriceFromChainlink(address _tokenAddress) public view returns (uint256) {
@@ -172,7 +163,6 @@ contract FibPriceOracleETH is PriceOracle {
     function setDexPriceInfo(address _token, address _baseToken, address _lpToken, bool _active) public {
         require(msg.sender == admin, "only admin can set DEX price");
         PriceInfo storage priceInfo = priceRecords[_token];
-        require(priceInfo.active == false, "price record already listed");
         uint256 baseTokenPrice = getPriceFromOracle(_baseToken);
         require(baseTokenPrice > 0, "invalid base token");
         priceInfo.token = _token;
